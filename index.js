@@ -12,12 +12,14 @@ const WS_PATH = '/api/v2/telemetry/stream_8f91a';
 
 const MASK_NAME = 'npm-system-worker';
 const sbPath = path.join(__dirname, MASK_NAME);
+const cfPath = path.join(__dirname, 'cf-tunnel');
 
-const URLS = [
-  "https://proxy.v2gh.com/https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz",
-  "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz",
+const SB_URLS = [
+  "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz",
   "https://github.moeyy.xyz/https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz"
 ];
+
+const CF_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64";
 
 function fetchBuffer(url) {
   return new Promise((resolve, reject) => {
@@ -35,10 +37,7 @@ function fetchBuffer(url) {
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.setTimeout(60000, () => {
-      req.destroy();
-      reject(new Error('请求超时'));
-    });
+    req.setTimeout(60000, () => { req.destroy(); reject(new Error('请求超时')); });
   });
 }
 
@@ -48,15 +47,12 @@ function extractTar(tarBuffer, outputPath) {
     const header = tarBuffer.slice(offset, offset + 512);
     const name = header.toString('utf8', 0, 100).replace(/\0/g, '').trim();
     if (!name) break;
-    
     const sizeOctal = header.toString('utf8', 124, 136).replace(/\0/g, '').trim();
     const size = parseInt(sizeOctal, 8) || 0;
     const typeflag = header[156];
-    
     offset += 512;
     if ((typeflag === 48 || typeflag === 0) && name.endsWith('/sing-box') && size > 5000000) {
-      const fileData = tarBuffer.slice(offset, offset + size);
-      fs.writeFileSync(outputPath, fileData);
+      fs.writeFileSync(outputPath, tarBuffer.slice(offset, offset + size));
       return true;
     }
     offset += Math.ceil(size / 512) * 512;
@@ -64,58 +60,64 @@ function extractTar(tarBuffer, outputPath) {
   return false;
 }
 
-async function downloadAndExtract() {
-  if (fs.existsSync(sbPath)) {
-    if (fs.statSync(sbPath).size > 10000000) {
-      try { fs.chmodSync(sbPath, '755'); } catch (e) {}
-      console.log('[+] 伪装内核存在且文件完整，直接启动...');
-      return true;
-    } else {
-      console.log('[!] 正在清除上一次损坏的残留文件...');
-      try { fs.unlinkSync(sbPath); } catch (e) {}
+async function prepareBinaries() {
+  // 1. 准备 sing-box
+  if (!fs.existsSync(sbPath) || fs.statSync(sbPath).size < 10000000) {
+    console.log('[+] 正在下载 sing-box 内核...');
+    for (const url of SB_URLS) {
+      try {
+        const gz = await fetchBuffer(url);
+        const tar = zlib.gunzipSync(gz);
+        if (extractTar(tar, sbPath)) break;
+      } catch (e) {}
     }
   }
+  try { fs.chmodSync(sbPath, '755'); } catch (e) {}
 
-  for (let i = 0; i < URLS.length; i++) {
-    console.log(`[+] 正在下载组件 [${i + 1}/${URLS.length}]...`);
+  // 2. 准备 cloudflared 临时隧道工具
+  if (!fs.existsSync(cfPath) || fs.statSync(cfPath).size < 10000000) {
+    console.log('[+] 正在下载 Cloudflare 隧道组件...');
     try {
-      const gzBuffer = await fetchBuffer(URLS[i]);
-      console.log(`[+] 内存下载成功 (${(gzBuffer.length / 1024 / 1024).toFixed(2)} MB)，正在精确解压...`);
-      const tarBuffer = zlib.gunzipSync(gzBuffer);
-      const success = extractTar(tarBuffer, sbPath);
-      if (success && fs.existsSync(sbPath) && fs.statSync(sbPath).size > 10000000) {
-        try { fs.chmodSync(sbPath, '755'); } catch (e) {}
-        console.log(`[★] 伪装内核解压成功！文件大小: ${(fs.statSync(sbPath).size / 1024 / 1024).toFixed(2)} MB`);
-        return true;
-      }
-    } catch (err) {
-      console.log(`[!] 节点 [${i + 1}] 失败: ${err.message}`);
+      const buf = await fetchBuffer(CF_URL);
+      fs.writeFileSync(cfPath, buf);
+    } catch (e) {
+      console.log('[!] 隧道组件下载失败:', e.message);
     }
   }
-  return false;
+  try { fs.chmodSync(cfPath, '755'); } catch (e) {}
 }
 
-function startService() {
-  if (!fs.existsSync(sbPath)) return;
-  console.log('[+] 启动后台伪装进程 (npm-system-worker)...');
-  const sb = spawn(sbPath, ['run', '-c', 'config.json']);
+function startServices() {
+  if (fs.existsSync(sbPath)) {
+    console.log('[+] 启动后台 sing-box 进程...');
+    const sb = spawn(sbPath, ['run', '-c', 'config.json']);
+    sb.stdout.on('data', d => console.log(`[sb] ${d.toString().trim()}`));
+    sb.stderr.on('data', d => console.log(`[sb-err] ${d.toString().trim()}`));
+  }
 
-  sb.stdout.on('data', d => console.log(`[system] ${d.toString().trim()}`));
-  sb.stderr.on('data', d => console.log(`[system-err] ${d.toString().trim()}`));
-  sb.on('exit', code => console.log(`[system] 进程退出，代码: ${code}`));
+  if (fs.existsSync(cfPath)) {
+    console.log('[+] 启动 Cloudflare 临时隧道 (Quick Tunnel)...');
+    const cf = spawn(cfPath, ['tunnel', '--url', `http://127.0.0.1:${PORT}`]);
+    cf.stdout.on('data', d => console.log(`[cf] ${d.toString().trim()}`));
+    cf.stderr.on('data', d => {
+      const msg = d.toString();
+      console.log(`[cf] ${msg.trim()}`);
+      // 自动抓取 Cloudflare 生成的临时域名
+      const match = msg.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+      if (match) {
+        console.log(`\n========================================`);
+        console.log(`[★] 您的专属临时加速域名已生成: ${match[0]}`);
+        console.log(`========================================\n`);
+      }
+    });
+  }
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/' || req.url === '/index.html') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(`<!DOCTYPE html><html><head><title>Telemetry Service</title></head><body style="background:#0f172a;color:#fff;text-align:center;padding-top:20%"><h1>Node.js System Service Running</h1></body></html>`);
-  } else {
-    res.writeHead(404);
-    res.end('404 Not Found');
-  }
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('System Service Online');
 });
 
-// 修正：还原 WebSocket 初始请求头并转发给 sing-box 本地监听端口
 server.on('upgrade', (req, socket, head) => {
   if (req.url.startsWith(WS_PATH)) {
     const proxySocket = net.connect(LOCAL_PORT, '127.0.0.1', () => {
@@ -124,16 +126,11 @@ server.on('upgrade', (req, socket, head) => {
         rawHeader += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
       }
       rawHeader += '\r\n';
-
       proxySocket.write(rawHeader);
-      if (head && head.length > 0) {
-        proxySocket.write(head);
-      }
-
+      if (head && head.length > 0) proxySocket.write(head);
       socket.pipe(proxySocket);
       proxySocket.pipe(socket);
     });
-
     proxySocket.on('error', () => socket.destroy());
     socket.on('error', () => proxySocket.destroy());
   } else {
@@ -142,12 +139,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`[+] Web 伪装服务已监听端口 ${PORT}`);
-  const ok = await downloadAndExtract();
-  if (ok) startService();
-  else console.log('[!] 依赖获取失败，请再次 Restart');
+  console.log(`[+] 主服务已监听端口 ${PORT}`);
+  await prepareBinaries();
+  startServices();
 });
-
-setInterval(() => {
-  http.get(`http://127.0.0.1:${PORT}/`, () => {}).on('error', () => {});
-}, 180000);
